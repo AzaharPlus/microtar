@@ -62,6 +62,28 @@ static uint32_t checksum(const mtar_raw_header_t* rh) {
 }
 
 
+static int parse_octal(const char* field, size_t len, uint64_t* out) {
+	uint64_t value = 0;
+	size_t i = 0;
+	int digits = 0;
+	while (i < len && field[i] == ' ') {
+		i++;
+	}
+	for (; i < len && field[i] >= '0' && field[i] <= '7'; i++) {
+		if (value > (UINT64_MAX >> 3)) {
+			return MTAR_EFAILURE;
+		}
+		value = (value << 3) | (uint64_t)(field[i] - '0');
+		digits++;
+	}
+	if (!digits || (i < len && field[i] != '\0' && field[i] != ' ')) {
+		return MTAR_EFAILURE;
+	}
+	*out = value;
+	return MTAR_ESUCCESS;
+}
+
+
 static int tread(mtar_t* tar, void* data, size_t size) {
 	int err = tar->read(tar, data, size);
 	tar->pos += size;
@@ -91,9 +113,8 @@ static int write_null_bytes(mtar_t* tar, uint64_t n) {
 
 
 static int raw_to_header(mtar_header_t* h, const mtar_raw_header_t* rh) {
-	uint32_t chksum1, chksum2;
-	unsigned int mode, owner;
-	unsigned long long mtime, size;
+	uint32_t chksum1;
+	uint64_t chksum2, mode, owner, mtime, size;
 	int i;
 
 	/* If the checksum starts with a null byte we assume the record is NULL */
@@ -104,20 +125,22 @@ static int raw_to_header(mtar_header_t* h, const mtar_raw_header_t* rh) {
 
 	/* Build and compare checksum */
 	chksum1 = checksum(rh);
-	sscanf(rh->checksum, "%o", &chksum2);
-	if (chksum1 != chksum2) {
+	if (parse_octal(rh->checksum, sizeof(rh->checksum), &chksum2) || chksum1 != chksum2) {
 		return MTAR_EBADCHKSUM;
 	}
 
-	/* Parse into correctly sized local variable first, then assign into the
-	 * mtar_header_t fields.
-	 */
-	sscanf(rh->mode, "%o", &mode);
-	sscanf(rh->owner, "%o", &owner);
-	sscanf(rh->mtime, "%llo", &mtime);
+	if (parse_octal(rh->mode, sizeof(rh->mode), &mode)) {
+		mode = 0;
+	}
+	if (parse_octal(rh->owner, sizeof(rh->owner), &owner)) {
+		owner = 0;
+	}
+	if (parse_octal(rh->mtime, sizeof(rh->mtime), &mtime)) {
+		mtime = 0;
+	}
 	h->mode = (uint32_t)mode;
 	h->owner = (uint32_t)owner;
-	h->mtime = (uint64_t)mtime;
+	h->mtime = mtime;
 
 	/* Parse size field. The original octal ASCII only allows up
 	 * to (~8GB) of file size, but GNU tar's base256 extension
@@ -131,10 +154,10 @@ static int raw_to_header(mtar_header_t* h, const mtar_raw_header_t* rh) {
 			size = (size << 8) | (uint8_t)rh->size[i];
 		}
 	}
-	else {
-		sscanf(rh->size, "%llo", &size);
+	else if (parse_octal(rh->size, sizeof(rh->size), &size)) {
+		return MTAR_EFAILURE;
 	}
-	h->size = (uint64_t)size;
+	h->size = size;
 
 	h->type = rh->type;
 	strncpy(h->name, rh->name, 100);
@@ -151,9 +174,10 @@ static int header_to_raw(mtar_raw_header_t* rh, const mtar_header_t* h) {
 
 	/* Load header into raw header */
 	memset(rh, 0, sizeof(*rh));
-	sprintf(rh->mode, "%011o", (unsigned int)h->mode);
-	sprintf(rh->owner, "%011o", (unsigned int)h->owner);
-	sprintf(rh->mtime, "%011llo", (unsigned long long) h->mtime);
+	
+	snprintf(rh->mode, sizeof(rh->mode), "%07o", (unsigned int)(h->mode & 07777777));
+	snprintf(rh->owner, sizeof(rh->owner), "%07o", (unsigned int)(h->owner & 07777777));
+	snprintf(rh->mtime, sizeof(rh->mtime), "%011llo", (unsigned long long) h->mtime);
 
 	size = (unsigned long long) h->size;
 	/* Encode using base256 if size is bigger than(8 ^ 11 - 1) */
@@ -279,7 +303,10 @@ int mtar_next(mtar_t* tar) {
 	if (err) {
 		return err;
 	}
-	/* Seek to next record */
+	/* Seek to next record, refusing sizes that would wrap the position */
+	if (h.size > SIZE_MAX - 1024 || tar->pos > SIZE_MAX - 1024 - h.size) {
+		return MTAR_ESEEKFAIL;
+	}
 	n = round_up(h.size, 512) + sizeof(mtar_raw_header_t);
 	return mtar_seek(tar, (size_t)(tar->pos + n));
 }
@@ -390,7 +417,7 @@ int mtar_write_dir_header(mtar_t* tar, const char* name) {
 	mtar_header_t h;
 	/* Build header */
 	memset(&h, 0, sizeof(h));
-	strcpy(h.name, name);
+	strncpy(h.name, name, 100);
 	h.type = MTAR_TDIR;
 	h.mode = 0775;
 	/* Write header */
